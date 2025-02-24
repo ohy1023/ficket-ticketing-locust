@@ -7,25 +7,37 @@ import base64
 import hmac
 import hashlib
 import jwt
+import logging
 from websocket import WebSocketApp
 from locust import HttpUser, TaskSet, task, between
+
+# 로깅 설정
+logging.basicConfig(
+    level=logging.INFO,  # 로그 레벨 (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
 # 이미 생성된 userId를 저장하는 집합
 generated_user_ids = set()
 
+
 def generate_random_username(length=6):
     return ''.join(random.choices(string.ascii_letters, k=length))
 
+
 def generate_unique_user_id():
     while True:
-        user_id = random.randint(11, 10000000)
+        user_id = random.randint(3, 10000000)
         if user_id not in generated_user_ids:
             generated_user_ids.add(user_id)
             return user_id
 
+
 def create_signature(secret_key, message):
     signature = hmac.new(secret_key.encode(), message.encode(), hashlib.sha256).digest()
     return base64.urlsafe_b64encode(signature).decode().rstrip("=")
+
 
 def generate_jwt():
     header = {"alg": "HS256"}
@@ -43,24 +55,30 @@ def generate_jwt():
     signature = create_signature(secret_key, message)
     return f"{message}.{signature}"
 
+
 def extract_user_id(jwt_token):
-    # Decode JWT payload without verification (for simplicity)
     try:
         decoded_token = jwt.decode(jwt_token, options={"verify_signature": False})
         return decoded_token.get("userId")
     except Exception as e:
-        print(f"Error decoding JWT: {e}")
+        logging.error(f"JWT 디코딩 중 오류 발생: {e}")
         return None
 
+
 class TicketingBehavior(TaskSet):
-    event_id = 5  # eventId 변수로 분리
+    event_id = 20010  # eventId 변수로 분리
 
     def on_start(self):
         self.jwt_token = generate_jwt()
+        logging.info(f"JWT 생성 완료 - 사용자 ID: {extract_user_id(self.jwt_token)}")
 
     @task
     def view_event(self):
-        self.client.get(f"/api/v1/events/detail/{self.event_id}")
+        response = self.client.get(f"/api/v1/events/detail/{self.event_id}")
+        if response.status_code == 200:
+            logging.info(f"이벤트 상세 정보 조회 성공 - 이벤트 ID: {self.event_id}")
+        else:
+            logging.error(f"이벤트 상세 정보 조회 실패 - 상태 코드: {response.status_code}")
 
     @task
     def ticketing(self):
@@ -75,64 +93,63 @@ class TicketingBehavior(TaskSet):
                 else:
                     self.handle_enter_queue(headers)
             except Exception as e:
-                print(f"Error processing can-enter response: {e}")
+                logging.error(f"대기열 진입 여부 처리 중 오류 발생: {e}")
         else:
-            print(f"Error: can-enter request failed with status code {can_enter_response.status_code}")
+            logging.error(f"대기열 진입 여부 요청 실패 - 상태 코드: {can_enter_response.status_code}")
 
     def handle_occupy_slot(self, headers):
         occupy_response = self.client.post(f"/api/v1/queues/{self.event_id}/occupy-slot", headers=headers)
         if occupy_response.status_code == 200:
-            print("Occupy slot successful")
-            gevent.spawn_later(60, self.leave_queue, headers)
+            logging.info(f"슬롯 점유 성공 - 이벤트 ID: {self.event_id}")
+
+            # 60초 ~ 180초 (1분 ~ 3분) 사이 랜덤 시간 후 leave_slot 호출
+            random_delay = random.uniform(60, 180)
+            logging.info(f"슬롯 해제 예정 - {random_delay:.2f}초 후")
+            gevent.spawn_later(random_delay, self.leave_slot, headers)
         else:
-            print(f"Error: occupy-slot request failed with status code {occupy_response.status_code}")
+            logging.error(f"슬롯 점유 요청 실패 - 상태 코드: {occupy_response.status_code}")
 
     def handle_enter_queue(self, headers):
         enter_response = self.client.get(f"/api/v1/queues/{self.event_id}/enter", headers=headers)
         if enter_response.status_code == 200:
-            print("Enter queue successful")
-            self.connect_websocket()
+            logging.info(f"대기열 참여 성공 - 이벤트 ID: {self.event_id}")
+            self.connect_websocket(headers)
         else:
-            print(f"Error: enter request failed with status code {enter_response.status_code}")
+            logging.error(f"대기열 참여 요청 실패 - 상태 코드: {enter_response.status_code}")
 
-    def connect_websocket(self):
-        # URL 인코딩된 Bearer 토큰
-        # jwt = f"Bearer%20{self.jwt_token}"
+    def connect_websocket(self, headers):
         user_id = extract_user_id(self.jwt_token)
-        websocket_url = f"ws://localhost:9000/queue-status/{self.event_id}"
+        websocket_url = f"wss://api.ficket.shop/queue-status/{self.event_id}"
 
         headers = {
-            "X-User-Id": str(user_id),  # Add userId in the header
+            "X-User-Id": str(user_id),
         }
 
-        # 메시지 핸들러
         def on_message(ws, message):
-            print(f"WebSocket message received: {message}")
+            logging.info(f"WebSocket 메시지 수신: {message}")
 
             try:
-                # JSON 메시지 파싱
                 data = json.loads(message)
-
-                # queueStatus가 Completed인지 확인
                 if data.get("queueStatus") == "Completed":
-                    print("Queue status is 'Completed'. Closing WebSocket.")
+                    ws.close()
+                    random_delay = random.uniform(60, 180)  # 60초 ~ 180초
+                    logging.info(f"슬롯 해제 예약 - {random_delay:.2f}초 후")
+                    gevent.spawn_later(random_delay, self.leave_slot, headers)
+                elif data.get("queueStatus") == "Cancelled":
+                    logging.info("대기열 상태: 'Cancelled'. WebSocket 연결 종료.")
                     ws.close()
             except json.JSONDecodeError:
-                print("Received message is not valid JSON")
+                logging.error("수신한 메시지가 유효한 JSON 형식이 아님")
 
-        # 에러 핸들러
         def on_error(ws, error):
-            print(f"WebSocket error: {error}")
+            logging.error(f"WebSocket 오류 발생: {error}")
 
-        # 연결 종료 핸들러
         def on_close(ws, close_status_code, close_msg):
-            print(f"WebSocket connection closed: {close_status_code}, {close_msg}")
+            logging.info(f"WebSocket 연결 종료 - 상태 코드: {close_status_code}, 메시지: {close_msg}")
 
-        # 연결 성공 핸들러
         def on_open(ws):
-            print("WebSocket connection established")
+            logging.info("WebSocket 연결 성공")
 
-        # WebSocket 초기화
         ws = WebSocketApp(
             websocket_url,
             header=headers,
@@ -145,18 +162,19 @@ class TicketingBehavior(TaskSet):
         try:
             gevent.spawn(ws.run_forever)
         except Exception as e:
-            print(f"WebSocket connection failed: {e}")
+            logging.error(f"WebSocket 연결 실패: {e}")
         finally:
-            ws = None  # 연결 종료 후 WebSocket 객체 해제
+            ws = None
 
-    def leave_queue(self, headers):
+    def leave_slot(self, headers):
         response = self.client.delete(f"/api/v1/queues/{self.event_id}/release-slot", headers=headers)
         if response.status_code == 200:
-            print("Successfully left the queue.")
+            logging.info("슬롯 해제 성공")
         else:
-            print(f"Error: leave queue request failed with status code {response.status_code}")
+            logging.error(f"슬롯 해제 요청 실패 - 상태 코드: {response.status_code}")
+
 
 class TicketingUser(HttpUser):
     tasks = [TicketingBehavior]
-    wait_time = between(1, 3)
-    host = "http://localhost:9000"
+    wait_time = between(1, 3)  # 1초 ~ 3초 간격
+    host = "https://api.ficket.shop"
